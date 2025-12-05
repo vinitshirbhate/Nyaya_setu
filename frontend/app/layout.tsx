@@ -40,6 +40,12 @@ export default function RootLayout({ children }: { children: ReactNode }) {
                   Upload
                 </Link>
                 <Link
+                  href="/documents"
+                  className="px-3 py-1.5 rounded-md hover:bg-slate-900/70 transition-colors"
+                >
+                  Documents
+                </Link>
+                <Link
                   href="/transcripts"
                   className="px-3 py-1.5 rounded-md hover:bg-slate-900/70 transition-colors"
                 >

@@ -36,3 +36,43 @@ export interface ConversationMessage {
   content: string;
 }
 
+// Document RAG API Types
+export interface DocumentRecord {
+  id: string;
+  filename: string;
+  case_id?: string;
+  uploaded_at: string;
+  summary_brief?: string;
+  summary_detailed?: string;
+  summary_key_points?: string;
+}
+
+export interface DocumentListResponse {
+  documents: DocumentRecord[];
+  total: number;
+}
+
+export interface DocumentUploadResponse {
+  id: string;
+  filename: string;
+  message: string;
+}
+
+export interface DocumentSummaryResponse {
+  doc_id: string;
+  summary_type: "brief" | "detailed" | "key_points";
+  summary: string;
+}
+
+export interface DocumentChatResponse {
+  answer: string;
+  doc_id: string;
+}
+
+export interface DocumentDeleteResponse {
+  message: string;
+  doc_id: string;
+}
+
+export type DocumentSummaryType = "brief" | "detailed" | "key_points";
+
