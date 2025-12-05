@@ -24,7 +24,9 @@ export interface TranscriptionResponse {
   transcription: string;
   transcription_segments: TranscriptSegment[];
   original_file: string;
-  audio_url: string;
+  audio_url?: string;
+  youtube_url?: string;
+  youtube_video_id?: string;
 }
 
 export type SummaryType = "brief" | "detailed" | "key_points";

@@ -33,6 +33,23 @@ from io import BytesIO
 from bson.objectid import ObjectId
 from fastapi.responses import StreamingResponse
 import google.generativeai as genai
+from youtube_transcript_api import YouTubeTranscriptApi, TranscriptsDisabled
+import re
+from urllib.parse import urlparse, parse_qs
+
+# Suppress PyMongo debug logs
+logging.getLogger("pymongo").setLevel(logging.WARNING)
+
+# Set up logging
+logging.basicConfig(
+    level=logging.DEBUG,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler("app.log"),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
 
 # Check if FFmpeg exists at your specified path
 ffmpeg_dir = r"C:\ffmpeg\bin"
@@ -54,21 +71,7 @@ else:
     logger.error("Please download FFmpeg from https://github.com/BtbN/FFmpeg-Builds/releases")
     raise FileNotFoundError("FFmpeg not found")
 
-# Suppress PyMongo debug logs
-logging.getLogger("pymongo").setLevel(logging.WARNING)
-
-# Set up logging
-logging.basicConfig(
-    level=logging.DEBUG,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler("app.log"),
-        logging.StreamHandler()
-    ]
-)
-logger = logging.getLogger(__name__)
-
-mongo_uri = "mongodb+srv://vinitshirbhate_db_user:bfOmEp2aRbZX3UST@cluster0.mx9ptq8.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0"
+mongo_uri ="mongodb+srv://vinitshirbhate_db_user:bfOmEp2aRbZX3UST@cluster0.mx9ptq8.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0"
 
 try:
     mongo_client = MongoClient(mongo_uri)
@@ -140,6 +143,172 @@ class ChatRequest(BaseModel):
 class SummaryRequest(BaseModel):
     transcript_id: str
     summary_type: Optional[str] = "detailed"  # Options: "brief", "detailed", "key_points"
+
+class YouTubeRequest(BaseModel):
+    youtube_url: str
+
+# Helper function to extract YouTube video ID from URL
+def extract_youtube_video_id(url: str) -> str:
+    """
+    Extract video ID from various YouTube URL formats:
+    - https://www.youtube.com/watch?v=VIDEO_ID
+    - https://youtu.be/VIDEO_ID
+    - https://www.youtube.com/embed/VIDEO_ID
+    - https://youtube.com/watch?v=VIDEO_ID
+    - VIDEO_ID (if just the ID is provided)
+    """
+    # If it's already just an ID (11 characters, alphanumeric)
+    if re.match(r'^[a-zA-Z0-9_-]{11}$', url):
+        return url
+    
+    # Try to parse as URL
+    try:
+        parsed = urlparse(url)
+        
+        # Handle youtu.be short URLs
+        if 'youtu.be' in parsed.netloc:
+            video_id = parsed.path.lstrip('/')
+            if video_id:
+                return video_id.split('?')[0]
+        
+        # Handle youtube.com/watch?v=VIDEO_ID
+        if 'youtube.com' in parsed.netloc or 'www.youtube.com' in parsed.netloc:
+            if parsed.path == '/watch':
+                query_params = parse_qs(parsed.query)
+                if 'v' in query_params:
+                    return query_params['v'][0]
+            # Handle /embed/VIDEO_ID
+            elif '/embed/' in parsed.path:
+                video_id = parsed.path.split('/embed/')[-1]
+                return video_id.split('?')[0]
+        
+        # Try regex as fallback
+        patterns = [
+            r'(?:youtube\.com\/watch\?v=|youtu\.be\/|youtube\.com\/embed\/)([a-zA-Z0-9_-]{11})',
+            r'([a-zA-Z0-9_-]{11})'
+        ]
+        
+        for pattern in patterns:
+            match = re.search(pattern, url)
+            if match:
+                return match.group(1) if match.groups() else match.group(0)
+        
+        raise ValueError("Could not extract video ID from URL")
+    except Exception as e:
+        logger.error(f"Error extracting video ID: {str(e)}")
+        raise ValueError(f"Invalid YouTube URL: {str(e)}")
+
+# YouTube transcript endpoint
+@app.post("/transcribe-youtube/")
+async def transcribe_youtube(request: YouTubeRequest):
+    """
+    Fetch transcript from YouTube video using YouTube Transcript API
+    """
+    logger.info(f"Received YouTube transcription request: {request.youtube_url}")
+    
+    try:
+        # Extract video ID from URL
+        video_id = extract_youtube_video_id(request.youtube_url)
+        logger.info(f"Extracted video ID: {video_id}")
+        
+        # Fetch transcript from YouTube
+        logger.info("Fetching transcript from YouTube...")
+        ytt_api = YouTubeTranscriptApi()
+        
+        try:
+            fetched_transcript = ytt_api.fetch(video_id)
+        except TranscriptsDisabled:
+            logger.error(f"Transcripts are disabled for video: {video_id}")
+            raise HTTPException(
+                status_code=400, 
+                detail="Transcripts are disabled for this YouTube video. Please use a video with captions enabled."
+            )
+        except Exception as e:
+            logger.error(f"Failed to fetch YouTube transcript: {str(e)}")
+            raise HTTPException(
+                status_code=400,
+                detail=f"Failed to fetch transcript from YouTube: {str(e)}"
+            )
+        
+        # Process transcript data
+        logger.debug(f"Processing {len(fetched_transcript)} transcript chunks")
+        transcript_data = []
+        
+        for chunk in fetched_transcript:
+            text = chunk.text.strip()
+            start_time = chunk.start
+            duration = chunk.duration
+            end_time = start_time + duration
+            
+            if text:
+                # YouTube transcripts don't have speaker labels, so we use speaker 0
+                transcript_data.append((0, text, start_time, end_time))
+        
+        # Merge transcript segments (similar to audio transcription)
+        merged_transcript = merge_speaker_text(transcript_data)
+        logger.debug(f"Speaker text merged into {len(merged_transcript)} segments")
+        
+        # Combine full text
+        full_text = " ".join([text for _, text, _, _ in merged_transcript])
+        logger.info(f"Combined transcript text length: {len(full_text)} characters")
+        
+        # Create YouTube video URL for reference
+        youtube_video_url = f"https://www.youtube.com/watch?v={video_id}"
+        
+        # Save transcript to MongoDB
+        logger.info("Saving transcript to MongoDB")
+        transcript_record = {
+            "original_file": f"YouTube Video: {video_id}",
+            "youtube_url": youtube_video_url,
+            "youtube_video_id": video_id,
+            "audio_path": youtube_video_url,  # Store YouTube URL as audio_path for consistency
+            "created_at": datetime.datetime.now(),
+            "transcription": [
+                {
+                    "speaker": speaker,
+                    "text": text,
+                    "start_time": start,
+                    "end_time": end
+                }
+                for speaker, text, start, end in merged_transcript
+            ],
+            "text": full_text,
+        }
+        
+        logger.debug(f"MongoDB record created with {len(transcript_record['transcription'])} segments")
+        
+        try:
+            record_id = collection.insert_one(transcript_record).inserted_id
+            logger.info(f"Transcript saved to MongoDB with ID: {record_id}")
+        except Exception as e:
+            logger.error(f"Failed to save to MongoDB: {str(e)}")
+            raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
+        
+        logger.info("YouTube transcription process completed successfully")
+        
+        return JSONResponse({
+            "message": "YouTube transcription completed successfully",
+            "transcript_id": str(record_id),
+            "transcription": full_text,
+            "transcription_segments": [
+                {
+                    "speaker": speaker,
+                    "text": text,
+                    "start_time": start,
+                    "end_time": end
+                }
+                for speaker, text, start, end in merged_transcript
+            ],
+            "original_file": f"YouTube Video: {video_id}",
+            "youtube_url": youtube_video_url,
+            "youtube_video_id": video_id
+        })
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"YouTube transcription failed: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"YouTube transcription failed: {str(e)}")
 
 # Existing transcribe endpoint (keeping as is)
 @app.post("/transcribe/")
