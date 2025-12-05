@@ -1,0 +1,18 @@
+# Ignore node_modules in both frontend and backend
+frontend/node_modules/
+backend/myEnv/
+
+# Ignore your custom folder
+woven-plane-474614-j8-04b77c8a4ab8.json
+.venv
+.venv/
+/uploads
+/reports
+app.log
+.next
+__pycache__/
+# Optional: common Node.js ignores
+*.log
+.env
+.env.local
+node_modules

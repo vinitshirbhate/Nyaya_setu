@@ -1,0 +1,21 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color-scheme: dark;
+}
+
+body {
+  @apply bg-background text-foreground;
+}
+
+.card-surface {
+  @apply bg-slate-900/70 border border-border rounded-lg shadow-lg shadow-black/30 backdrop-blur;
+}
+
+.pill {
+  @apply inline-flex items-center gap-1 rounded-full px-2.5 py-0.5 text-[11px] font-medium;
+}
+
+
