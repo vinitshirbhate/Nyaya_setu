@@ -15,6 +15,8 @@ export interface TranscriptRecord {
   summary_brief?: string;
   summary_detailed?: string;
   summary_key_points?: string;
+  related_cases?: RelatedCase[];
+  legal_queries_used?: string[];
   [key: `summary_${string}`]: string | undefined;
 }
 
@@ -34,6 +36,14 @@ export type SummaryType = "brief" | "detailed" | "key_points";
 export interface ConversationMessage {
   role: "user" | "assistant";
   content: string;
+}
+
+// Related Case Law Types
+export interface RelatedCase {
+  title: string;
+  snippet: string;
+  url: string;
+  similarity_score?: number;
 }
 
 // Document RAG API Types

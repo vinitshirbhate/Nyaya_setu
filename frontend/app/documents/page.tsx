@@ -290,7 +290,7 @@ export default function DocumentsPage() {
             <Button
               variant="outline"
               size="sm"
-              onClick={loadDocuments}
+              onClick={() => loadDocuments()}
               disabled={loadingDocuments}
             >
               {loadingDocuments ? (

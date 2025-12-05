@@ -1,14 +1,15 @@
 "use client";
 
 import { useMemo, useState } from "react";
-import { Loader2, Download, MessageSquare, Sparkles } from "lucide-react";
+import { Loader2, Download, MessageSquare, Sparkles, Scale, ExternalLink } from "lucide-react";
 import Link from "next/link";
 
 import { API_BASE_URL, clientFetch } from "@/lib/api";
 import {
   ConversationMessage,
   SummaryType,
-  TranscriptRecord
+  TranscriptRecord,
+  RelatedCase
 } from "@/lib/types";
 import { Button } from "@/components/ui/button";
 import {
@@ -43,6 +44,12 @@ export default function TranscriptDetailClient({
   const [summary, setSummary] = useState<string>(
     transcript[`summary_${summaryType}`] ?? ""
   );
+  const [relatedCases, setRelatedCases] = useState<RelatedCase[]>(
+    transcript.related_cases ?? []
+  );
+  const [queriesUsed, setQueriesUsed] = useState<string[]>(
+    transcript.legal_queries_used ?? []
+  );
 
   const [question, setQuestion] = useState("");
   const [isChatLoading, setIsChatLoading] = useState(false);
@@ -65,6 +72,8 @@ export default function TranscriptDetailClient({
     try {
       const res = await clientFetch<{
         summary: string;
+        related_cases?: RelatedCase[];
+        legal_queries_used?: string[];
       }>("/summarize/", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -74,6 +83,8 @@ export default function TranscriptDetailClient({
         })
       });
       setSummary(res.summary);
+      setRelatedCases(res.related_cases ?? []);
+      setQueriesUsed(res.legal_queries_used ?? []);
     } catch (err) {
       setSummary("");
       setChatError(err instanceof Error ? err.message : "Summary failed");
@@ -316,6 +327,91 @@ export default function TranscriptDetailClient({
           </Card>
         </div>
       </div>
+
+      {/* Related Case Law Section */}
+      {(relatedCases.length > 0 || queriesUsed.length > 0) && (
+        <Card className="border border-accent/40">
+          <CardHeader>
+            <div className="flex items-center gap-2">
+              <Scale className="h-5 w-5 text-accent" />
+              <div>
+                <CardTitle>Related Case Law</CardTitle>
+                <CardDescription>
+                  Past judgments and precedents related to this transcript
+                </CardDescription>
+              </div>
+            </div>
+          </CardHeader>
+          <CardContent className="space-y-4">
+            {queriesUsed.length > 0 && (
+              <div>
+                <p className="text-xs uppercase tracking-wide text-muted-foreground mb-2">
+                  Legal Search Queries Used
+                </p>
+                <div className="flex flex-wrap gap-2">
+                  {queriesUsed.map((query, idx) => (
+                    <Badge key={idx} variant="secondary" className="text-xs">
+                      {query}
+                    </Badge>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {relatedCases.length > 0 ? (
+              <div className="space-y-3">
+                <p className="text-xs uppercase tracking-wide text-muted-foreground">
+                  Top {relatedCases.length} Related Cases
+                </p>
+                <div className="grid gap-3">
+                  {relatedCases.map((caseItem, idx) => (
+                    <div
+                      key={idx}
+                      className="rounded-lg border border-slate-800/80 bg-slate-950/40 p-4 space-y-2"
+                    >
+                      <div className="flex items-start justify-between gap-3">
+                        <div className="flex-1 min-w-0">
+                          <h4 className="text-sm font-semibold mb-1 line-clamp-2">
+                            {caseItem.title}
+                          </h4>
+                          {caseItem.snippet && (
+                            <p className="text-xs text-muted-foreground line-clamp-2 mb-2">
+                              {caseItem.snippet}
+                            </p>
+                          )}
+                          {caseItem.url && (
+                            <a
+                              href={caseItem.url}
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              className="inline-flex items-center gap-1 text-xs text-primary hover:underline"
+                            >
+                              View on Indian Kanoon
+                              <ExternalLink className="h-3 w-3" />
+                            </a>
+                          )}
+                        </div>
+                        {caseItem.similarity_score !== undefined && (
+                          <Badge
+                            variant="outline"
+                            className="text-xs whitespace-nowrap"
+                          >
+                            {(caseItem.similarity_score * 100).toFixed(1)}% match
+                          </Badge>
+                        )}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            ) : (
+              <p className="text-sm text-muted-foreground">
+                No related cases found. Generate a summary to search for related case law.
+              </p>
+            )}
+          </CardContent>
+        </Card>
+      )}
 
       <Card className="border border-slate-800/80">
         <CardHeader>
