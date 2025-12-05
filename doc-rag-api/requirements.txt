@@ -1,0 +1,26 @@
+fastapi==0.115.5
+uvicorn[standard]==0.32.1
+python-multipart==0.0.17
+python-dotenv==1.0.1
+
+# Database
+pymongo>=4.5,<4.10
+motor==3.6.0
+
+# Vector Store & RAG
+faiss-cpu
+langchain==0.3.1
+langchain-community==0.3.1
+langchain-google-genai==2.0.5
+langgraph==0.2.45
+
+# Document Processing
+pypdf==5.1.0
+python-docx==1.1.2
+
+# LLM
+google-generativeai==0.8.3
+
+# Utilities
+pydantic==2.10.3
+pydantic-settings==2.6.1
