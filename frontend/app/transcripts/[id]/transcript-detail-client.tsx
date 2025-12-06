@@ -1,7 +1,7 @@
 "use client";
 
 import { useMemo, useState } from "react";
-import { Loader2, Download, MessageSquare, Sparkles, Scale, ExternalLink } from "lucide-react";
+import { Loader2, Download, MessageSquare, Sparkles, Scale, ExternalLink, BookOpen } from "lucide-react";
 import Link from "next/link";
 
 import { API_BASE_URL, clientFetch } from "@/lib/api";
@@ -67,6 +67,16 @@ export default function TranscriptDetailClient({
   }, [transcript.created_at]);
 
   async function handleSummarize() {
+    // Check if transcript has text content before attempting summary
+    const hasText = transcript.text?.trim() || 
+                    (transcript.transcription && transcript.transcription.length > 0 && 
+                     transcript.transcription.some(seg => seg.text?.trim()));
+    
+    if (!hasText) {
+      setChatError("This transcript has no text content available for summarization.");
+      return;
+    }
+
     setIsSummarizing(true);
     setChatError("");
     try {
@@ -87,7 +97,8 @@ export default function TranscriptDetailClient({
       setQueriesUsed(res.legal_queries_used ?? []);
     } catch (err) {
       setSummary("");
-      setChatError(err instanceof Error ? err.message : "Summary failed");
+      const errorMessage = err instanceof Error ? err.message : "Summary generation failed";
+      setChatError(errorMessage);
     } finally {
       setIsSummarizing(false);
     }
@@ -161,41 +172,73 @@ export default function TranscriptDetailClient({
       </div>
 
       <div className="grid gap-6 lg:grid-cols-[2fr,1fr]">
-        <Card className="border border-slate-800/80">
-          <CardHeader>
-            <CardTitle>Transcript body</CardTitle>
-            <CardDescription>
-              Speaker labelled segments merged from AssemblyAI output.
-            </CardDescription>
-          </CardHeader>
-          <CardContent className="space-y-4">
-            <div className="grid gap-3 max-h-[480px] overflow-y-auto pr-2">
-              {segments.map((segment, idx) => (
-                <div
-                  key={`${segment.speaker}-${segment.start_time}-${idx}`}
-                  className="rounded-lg border border-slate-800/80 bg-slate-950/40 p-3"
-                >
-                  <div className="flex items-center justify-between text-xs text-muted-foreground">
-                    <span className="flex items-center gap-2">
-                      <Badge variant="muted">Speaker {segment.speaker}</Badge>
-                      <span>
-                        {segment.start_time.toFixed(2)}s →{" "}
-                        {segment.end_time.toFixed(2)}s
+        <div className="space-y-6">
+          <Card className="border border-slate-800/80">
+            <CardHeader>
+              <CardTitle>Transcript body</CardTitle>
+              <CardDescription>
+                Speaker labelled segments merged from AssemblyAI output.
+              </CardDescription>
+            </CardHeader>
+            <CardContent className="space-y-4">
+              <div className="grid gap-3 max-h-[480px] overflow-y-auto pr-2">
+                {segments.map((segment, idx) => (
+                  <div
+                    key={`${segment.speaker}-${segment.start_time}-${idx}`}
+                    className="rounded-lg border border-slate-800/80 bg-slate-950/40 p-3"
+                  >
+                    <div className="flex items-center justify-between text-xs text-muted-foreground">
+                      <span className="flex items-center gap-2">
+                        <Badge variant="muted">Speaker {segment.speaker}</Badge>
+                        <span>
+                          {segment.start_time.toFixed(2)}s →{" "}
+                          {segment.end_time.toFixed(2)}s
+                        </span>
                       </span>
-                    </span>
-                    <span>#{idx + 1}</span>
+                      <span>#{idx + 1}</span>
+                    </div>
+                    <p className="text-sm mt-2">{segment.text}</p>
                   </div>
-                  <p className="text-sm mt-2">{segment.text}</p>
+                ))}
+                {segments.length === 0 && (
+                  <p className="text-sm text-muted-foreground">
+                    No segments were stored for this transcript.
+                  </p>
+                )}
+              </div>
+            </CardContent>
+          </Card>
+
+          {/* Constitution Sections Row */}
+          {transcript.constitution_sections && transcript.constitution_sections.length > 0 && (
+            <Card className="border border-slate-800/80">
+              <CardHeader>
+                <div className="flex items-center gap-2">
+                  <BookOpen className="h-5 w-5 text-accent" />
+                  <div>
+                    <CardTitle>Constitution Sections & Legal Provisions</CardTitle>
+                    <CardDescription>
+                      Articles and sections referenced in this case
+                    </CardDescription>
+                  </div>
                 </div>
-              ))}
-              {segments.length === 0 && (
-                <p className="text-sm text-muted-foreground">
-                  No segments were stored for this transcript.
-                </p>
-              )}
-            </div>
-          </CardContent>
-        </Card>
+              </CardHeader>
+              <CardContent>
+                <div className="flex flex-wrap gap-2">
+                  {transcript.constitution_sections.map((section, idx) => (
+                    <Badge
+                      key={idx}
+                      variant="secondary"
+                      className="text-sm px-3 py-1.5 font-mono bg-slate-900/70 border-accent/30 text-white hover:bg-slate-900/90 transition-colors"
+                    >
+                      {section}
+                    </Badge>
+                  ))}
+                </div>
+              </CardContent>
+            </Card>
+          )}
+        </div>
 
         <div className="space-y-4">
           <Card className="border border-primary/30">
@@ -371,9 +414,22 @@ export default function TranscriptDetailClient({
                     >
                       <div className="flex items-start justify-between gap-3">
                         <div className="flex-1 min-w-0">
-                          <h4 className="text-sm font-semibold mb-1 line-clamp-2">
-                            {caseItem.title}
-                          </h4>
+                          {caseItem.url ? (
+                            <a
+                              href={caseItem.url}
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              className="block"
+                            >
+                              <h4 className="text-sm font-semibold mb-1 line-clamp-2 text-primary hover:underline">
+                                {caseItem.title}
+                              </h4>
+                            </a>
+                          ) : (
+                            <h4 className="text-sm font-semibold mb-1 line-clamp-2">
+                              {caseItem.title}
+                            </h4>
+                          )}
                           {caseItem.snippet && (
                             <p className="text-xs text-muted-foreground line-clamp-2 mb-2">
                               {caseItem.snippet}
@@ -384,16 +440,16 @@ export default function TranscriptDetailClient({
                               href={caseItem.url}
                               target="_blank"
                               rel="noopener noreferrer"
-                              className="inline-flex items-center gap-1 text-xs text-primary hover:underline"
+                              className="inline-flex items-center gap-1 text-xs text-primary hover:underline hover:text-primary/80 transition-colors mt-1"
                             >
-                              View on Indian Kanoon
+                              Open on Indian Kanoon
                               <ExternalLink className="h-3 w-3" />
                             </a>
                           )}
                         </div>
                         {caseItem.similarity_score !== undefined && (
                           <Badge
-                            variant="outline"
+                            variant="secondary"
                             className="text-xs whitespace-nowrap"
                           >
                             {(caseItem.similarity_score * 100).toFixed(1)}% match
@@ -406,7 +462,7 @@ export default function TranscriptDetailClient({
               </div>
             ) : (
               <p className="text-sm text-muted-foreground">
-                No related cases found. Generate a summary to search for related case law.
+                {/* No related cases found. Generate a summary to search for related case law. */}
               </p>
             )}
           </CardContent>

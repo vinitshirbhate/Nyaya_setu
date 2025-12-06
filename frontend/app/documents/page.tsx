@@ -12,6 +12,7 @@ import {
   DocumentSummaryResponse,
   DocumentChatResponse,
   DocumentSummaryType,
+  CombinedSummaryResponse,
 } from "@/lib/types";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -20,14 +21,14 @@ import { Badge } from "@/components/ui/badge";
 import { Textarea } from "@/components/ui/textarea";
 
 export default function DocumentsPage() {
-  const [file, setFile] = useState<File | null>(null);
+  const [files, setFiles] = useState<File[]>([]);
   const [caseId, setCaseId] = useState("");
   const [status, setStatus] = useState<"idle" | "uploading" | "success" | "error">("idle");
   const [error, setError] = useState("");
-  const [uploadResult, setUploadResult] = useState<DocumentUploadResponse | null>(null);
+  const [uploadResults, setUploadResults] = useState<DocumentUploadResponse[]>([]);
   const [documents, setDocuments] = useState<DocumentRecord[]>([]);
   const [loadingDocuments, setLoadingDocuments] = useState(false);
-  const [selectedDoc, setSelectedDoc] = useState<DocumentRecord | null>(null);
+  const [selectedDocs, setSelectedDocs] = useState<string[]>([]); // Multiple selected document IDs
   const [summaryType, setSummaryType] = useState<DocumentSummaryType>("brief");
   const [summary, setSummary] = useState<string | null>(null);
   const [loadingSummary, setLoadingSummary] = useState(false);
@@ -38,35 +39,51 @@ export default function DocumentsPage() {
   async function handleUpload(e: React.FormEvent<HTMLFormElement>) {
     e.preventDefault();
 
-    if (!file) {
-      setError("Please choose a document file (PDF, DOCX, or TXT).");
+    if (files.length === 0) {
+      setError("Please choose at least one document file (PDF, DOCX, or TXT).");
       return;
     }
 
     setStatus("uploading");
     setError("");
-    setUploadResult(null);
+    setUploadResults([]);
 
-    const formData = new FormData();
-    formData.append("file", file);
-    if (caseId.trim()) {
-      formData.append("case_id", caseId.trim());
+    const results: DocumentUploadResponse[] = [];
+    const errors: string[] = [];
+
+    // Upload files sequentially to avoid overwhelming the server
+    for (let i = 0; i < files.length; i++) {
+      const file = files[i];
+      try {
+        const formData = new FormData();
+        formData.append("file", file);
+        if (caseId.trim()) {
+          formData.append("case_id", caseId.trim());
+        }
+
+        const data = await documentClientFetch<DocumentUploadResponse>("/documents/", {
+          method: "POST",
+          body: formData,
+        });
+        results.push(data);
+      } catch (err) {
+        errors.push(`${file.name}: ${err instanceof Error ? err.message : "Upload failed"}`);
+      }
     }
 
-    try {
-      const data = await documentClientFetch<DocumentUploadResponse>("/documents/", {
-        method: "POST",
-        body: formData,
-      });
-      setUploadResult(data);
+    if (results.length > 0) {
+      setUploadResults(results);
       setStatus("success");
-      setFile(null);
+      if (errors.length > 0) {
+        setError(`Some files failed: ${errors.join(", ")}`);
+      }
+      setFiles([]);
       setCaseId("");
       // Refresh document list
       loadDocuments();
-    } catch (err) {
+    } else {
       setStatus("error");
-      setError(err instanceof Error ? err.message : "Upload failed");
+      setError(errors.join(", ") || "All uploads failed");
     }
   }
 
@@ -88,29 +105,57 @@ export default function DocumentsPage() {
   async function loadDocument(docId: string) {
     try {
       const data = await documentClientFetch<DocumentRecord>(`/documents/${docId}`);
-      setSelectedDoc(data);
-      setSummary(null);
-      setChatAnswer(null);
+      // Toggle selection
+      if (selectedDocs.includes(docId)) {
+        setSelectedDocs(selectedDocs.filter(id => id !== docId));
+      } else {
+        setSelectedDocs([...selectedDocs, docId]);
+      }
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to load document");
     }
   }
 
-  async function generateSummary(docId: string, type: DocumentSummaryType) {
+  async function generateSummary(type: DocumentSummaryType) {
+    if (selectedDocs.length === 0) {
+      setError("Please select at least one document to generate a summary.");
+      return;
+    }
+
     setLoadingSummary(true);
     setSummary(null);
+    setError("");
     try {
-      const data = await documentClientFetch<DocumentSummaryResponse>(
-        `/documents/${docId}/summary`,
-        {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-          },
-          body: JSON.stringify({ summary_type: type }),
-        }
-      );
-      setSummary(data.summary);
+      // If multiple documents selected, use combined summary endpoint
+      if (selectedDocs.length > 1) {
+        const data = await documentClientFetch<CombinedSummaryResponse>(
+          "/documents/combined-summary",
+          {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+            },
+            body: JSON.stringify({ 
+              doc_ids: selectedDocs,
+              summary_type: type 
+            }),
+          }
+        );
+        setSummary(data.summary);
+      } else {
+        // Single document summary
+        const data = await documentClientFetch<DocumentSummaryResponse>(
+          `/documents/${selectedDocs[0]}/summary`,
+          {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+            },
+            body: JSON.stringify({ summary_type: type }),
+          }
+        );
+        setSummary(data.summary);
+      }
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to generate summary");
     } finally {
@@ -118,19 +163,27 @@ export default function DocumentsPage() {
     }
   }
 
-  async function handleChat(docId: string, message: string) {
+  async function handleChat(message: string) {
     if (!message.trim()) return;
+    
+    if (selectedDocs.length === 0) {
+      setError("Please select at least one document to chat with.");
+      return;
+    }
 
     setLoadingChat(true);
     setChatAnswer(null);
+    setError("");
     try {
+      // Support both single and multiple document chat
       const data = await documentClientFetch<DocumentChatResponse>("/documents/chat", {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
         },
         body: JSON.stringify({
-          doc_id: docId,
+          doc_id: selectedDocs.length === 1 ? selectedDocs[0] : undefined,
+          doc_ids: selectedDocs.length > 1 ? selectedDocs : undefined,
           message: message.trim(),
         }),
       });
@@ -152,8 +205,9 @@ export default function DocumentsPage() {
       });
       // Refresh document list
       loadDocuments();
-      if (selectedDoc?.id === docId) {
-        setSelectedDoc(null);
+      // Remove from selection if selected
+      setSelectedDocs(selectedDocs.filter(id => id !== docId));
+      if (selectedDocs.length === 1 && selectedDocs[0] === docId) {
         setSummary(null);
         setChatAnswer(null);
       }
@@ -188,18 +242,28 @@ export default function DocumentsPage() {
             <form onSubmit={handleUpload} className="space-y-4">
               <div className="space-y-2">
                 <label className="text-xs uppercase tracking-wide text-muted-foreground">
-                  Document file
+                  Document files (multiple selection allowed)
                 </label>
                 <Input
                   type="file"
                   accept=".pdf,.docx,.doc,.txt"
+                  multiple
                   onChange={(event) => {
-                    const nextFile = event.target.files?.[0] ?? null;
-                    setFile(nextFile);
+                    const selectedFiles = Array.from(event.target.files || []);
+                    setFiles(selectedFiles);
                   }}
                 />
+                {files.length > 0 && (
+                  <div className="flex flex-wrap gap-2 mt-2">
+                    {files.map((file, idx) => (
+                      <Badge key={idx} variant="secondary" className="text-xs">
+                        {file.name}
+                      </Badge>
+                    ))}
+                  </div>
+                )}
                 <p className="text-xs text-muted-foreground">
-                  Supported formats: PDF, DOCX, DOC, TXT
+                  Supported formats: PDF, DOCX, DOC, TXT. Select multiple files to upload together.
                 </p>
               </div>
 
@@ -225,21 +289,21 @@ export default function DocumentsPage() {
                 </div>
               )}
 
-              {status === "success" && uploadResult && (
+              {status === "success" && uploadResults.length > 0 && (
                 <div className="flex items-center gap-2 text-sm text-green-400 bg-green-400/10 border border-green-500/40 px-3 py-2 rounded-md">
                   <CheckCircle2 className="h-4 w-4" />
-                  Document uploaded successfully! ID: {uploadResult.id}
+                  {uploadResults.length} document{uploadResults.length !== 1 ? "s" : ""} uploaded successfully!
                 </div>
               )}
 
-              <Button type="submit" disabled={status === "uploading"}>
+              <Button type="submit" disabled={status === "uploading" || files.length === 0}>
                 {status === "uploading" ? (
                   <span className="flex items-center gap-2">
                     <Loader2 className="h-4 w-4 animate-spin" />
-                    Uploading and indexing...
+                    Uploading {files.length} document{files.length !== 1 ? "s" : ""}...
                   </span>
                 ) : (
-                  "Upload Document"
+                  `Upload ${files.length > 0 ? `${files.length} ` : ""}Document${files.length !== 1 ? "s" : ""}`
                 )}
               </Button>
             </form>
@@ -307,67 +371,107 @@ export default function DocumentsPage() {
               No documents uploaded yet. Upload a document to get started.
             </p>
           ) : (
-            <div className="grid gap-3">
-              {documents.map((doc) => (
-                <div
-                  key={doc.id}
-                  className="border border-slate-800/80 rounded-lg p-4 bg-slate-900/70 hover:bg-slate-900/90 transition-colors cursor-pointer"
-                  onClick={() => loadDocument(doc.id)}
-                >
-                  <div className="flex items-start justify-between gap-3">
-                    <div className="flex-1 min-w-0">
-                      <div className="flex items-center gap-2 mb-1">
-                        <h4 className="text-sm font-semibold truncate">{doc.filename}</h4>
-                        {doc.case_id && (
-                          <Badge variant="secondary" className="text-xs">
-                            {doc.case_id}
-                          </Badge>
-                        )}
-                      </div>
-                      <p className="text-xs text-muted-foreground">
-                        Uploaded: {new Date(doc.uploaded_at).toLocaleString()}
-                      </p>
-                    </div>
-                    <Button
-                      variant="ghost"
-                      size="icon"
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        deleteDocument(doc.id);
-                      }}
-                      className="text-red-400 hover:text-red-300 hover:bg-red-400/10"
-                    >
-                      <Trash2 className="h-4 w-4" />
-                    </Button>
+            <div className="space-y-3">
+              {selectedDocs.length > 0 && (
+                <div className="mb-4 p-3 bg-primary/10 border border-primary/30 rounded-lg">
+                  <p className="text-xs uppercase tracking-wide text-muted-foreground mb-2">
+                    {selectedDocs.length} document{selectedDocs.length !== 1 ? "s" : ""} selected
+                  </p>
+                  <div className="flex flex-wrap gap-2">
+                    {selectedDocs.map((docId) => {
+                      const doc = documents.find(d => d.id === docId);
+                      return doc ? (
+                        <Badge key={docId} variant="primary" className="text-xs">
+                          {doc.filename}
+                        </Badge>
+                      ) : null;
+                    })}
                   </div>
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    onClick={() => setSelectedDocs([])}
+                    className="mt-2 text-xs"
+                  >
+                    Clear selection
+                  </Button>
                 </div>
-              ))}
+              )}
+              <div className="grid gap-3">
+                {documents.map((doc) => (
+                  <div
+                    key={doc.id}
+                    className={`border rounded-lg p-4 transition-colors cursor-pointer ${
+                      selectedDocs.includes(doc.id)
+                        ? "border-primary bg-primary/10"
+                        : "border-slate-800/80 bg-slate-900/70 hover:bg-slate-900/90"
+                    }`}
+                    onClick={() => loadDocument(doc.id)}
+                  >
+                    <div className="flex items-start justify-between gap-3">
+                      <div className="flex-1 min-w-0">
+                        <div className="flex items-center gap-2 mb-1">
+                          <h4 className="text-sm font-semibold truncate">{doc.filename}</h4>
+                          {doc.case_id && (
+                            <Badge variant="secondary" className="text-xs">
+                              {doc.case_id}
+                            </Badge>
+                          )}
+                          {selectedDocs.includes(doc.id) && (
+                            <Badge variant="primary" className="text-xs">
+                              Selected
+                            </Badge>
+                          )}
+                        </div>
+                        <p className="text-xs text-muted-foreground">
+                          Uploaded: {new Date(doc.uploaded_at).toLocaleString()}
+                        </p>
+                      </div>
+                      <Button
+                        variant="ghost"
+                        size="icon"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          deleteDocument(doc.id);
+                        }}
+                        className="text-red-400 hover:text-red-300 hover:bg-red-400/10"
+                      >
+                        <Trash2 className="h-4 w-4" />
+                      </Button>
+                    </div>
+                  </div>
+                ))}
+              </div>
             </div>
           )}
         </CardContent>
       </Card>
 
-      {/* Document Detail */}
-      {selectedDoc && (
+      {/* Combined Summary & Chat Section */}
+      {selectedDocs.length > 0 && (
         <Card className="border border-primary/30">
           <CardHeader>
             <div className="flex items-center justify-between">
               <div className="flex items-center gap-3">
-                <CardTitle className="text-lg">{selectedDoc.filename}</CardTitle>
-                {selectedDoc.case_id && (
-                  <Badge variant="primary">{selectedDoc.case_id}</Badge>
+                <CardTitle className="text-lg">
+                  {selectedDocs.length === 1 
+                    ? documents.find(d => d.id === selectedDocs[0])?.filename || "Document"
+                    : `Combined Analysis (${selectedDocs.length} documents)`}
+                </CardTitle>
+                {selectedDocs.length > 1 && (
+                  <Badge variant="primary">{selectedDocs.length} selected</Badge>
                 )}
               </div>
               <Button
                 variant="ghost"
                 size="sm"
                 onClick={() => {
-                  setSelectedDoc(null);
+                  setSelectedDocs([]);
                   setSummary(null);
                   setChatAnswer(null);
                 }}
               >
-                Close
+                Clear Selection
               </Button>
             </div>
           </CardHeader>
@@ -375,7 +479,9 @@ export default function DocumentsPage() {
             {/* Summary Section */}
             <div className="space-y-3">
               <div className="flex items-center gap-3">
-                <h3 className="text-sm font-semibold">Summary</h3>
+                <h3 className="text-sm font-semibold">
+                  {selectedDocs.length > 1 ? "Combined Summary" : "Summary"}
+                </h3>
                 <div className="flex gap-2">
                   {(["brief", "detailed", "key_points"] as DocumentSummaryType[]).map((type) => (
                     <Button
@@ -384,7 +490,7 @@ export default function DocumentsPage() {
                       size="sm"
                       onClick={() => {
                         setSummaryType(type);
-                        generateSummary(selectedDoc.id, type);
+                        generateSummary(type);
                       }}
                       disabled={loadingSummary}
                     >
@@ -400,7 +506,7 @@ export default function DocumentsPage() {
               {loadingSummary ? (
                 <div className="flex items-center gap-2 text-sm text-muted-foreground">
                   <Loader2 className="h-4 w-4 animate-spin" />
-                  Generating summary...
+                  Generating {selectedDocs.length > 1 ? "combined " : ""}summary...
                 </div>
               ) : summary ? (
                 <div className="border border-slate-800/80 rounded-lg p-4 bg-slate-900/70">
@@ -408,22 +514,24 @@ export default function DocumentsPage() {
                 </div>
               ) : (
                 <p className="text-sm text-muted-foreground">
-                  Click a summary type to generate
+                  Click a summary type to generate {selectedDocs.length > 1 ? "combined summary" : "summary"}
                 </p>
               )}
             </div>
 
             {/* Chat Section */}
             <div className="space-y-3">
-              <h3 className="text-sm font-semibold">Chat with Document</h3>
+              <h3 className="text-sm font-semibold">
+                Chat with {selectedDocs.length > 1 ? "Documents" : "Document"}
+              </h3>
               <div className="space-y-2">
                 <Textarea
-                  placeholder="Ask a question about this document..."
+                  placeholder={`Ask a question about ${selectedDocs.length > 1 ? "these documents" : "this document"}...`}
                   value={chatMessage}
                   onChange={(e) => setChatMessage(e.target.value)}
                   onKeyDown={(e) => {
                     if (e.key === "Enter" && e.ctrlKey) {
-                      handleChat(selectedDoc.id, chatMessage);
+                      handleChat(chatMessage);
                     }
                   }}
                   rows={3}
@@ -433,7 +541,7 @@ export default function DocumentsPage() {
                     Press Ctrl+Enter to send
                   </p>
                   <Button
-                    onClick={() => handleChat(selectedDoc.id, chatMessage)}
+                    onClick={() => handleChat(chatMessage)}
                     disabled={loadingChat || !chatMessage.trim()}
                   >
                     {loadingChat ? (

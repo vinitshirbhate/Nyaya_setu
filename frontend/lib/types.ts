@@ -17,6 +17,7 @@ export interface TranscriptRecord {
   summary_key_points?: string;
   related_cases?: RelatedCase[];
   legal_queries_used?: string[];
+  constitution_sections?: string[];
   [key: `summary_${string}`]: string | undefined;
 }
 
@@ -77,6 +78,17 @@ export interface DocumentSummaryResponse {
 export interface DocumentChatResponse {
   answer: string;
   doc_id: string;
+}
+
+export interface CombinedSummaryRequest {
+  doc_ids: string[];
+  summary_type: DocumentSummaryType;
+}
+
+export interface CombinedSummaryResponse {
+  doc_ids: string[];
+  summary_type: string;
+  summary: string;
 }
 
 export interface DocumentDeleteResponse {

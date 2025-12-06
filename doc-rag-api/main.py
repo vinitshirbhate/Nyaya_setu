@@ -11,10 +11,12 @@ import logging
 import shutil
 
 from config import settings
+from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_core.prompts import ChatPromptTemplate
 from database import connect_to_mongo, close_mongo_connection, get_database
 from vectorstore import vector_store
 from doc_ingest import index_document
-from doc_summary import summarize_document, SummaryType
+from doc_summary import summarize_document, summarize_multiple_documents, SummaryType
 from rag_graph import rag_app
 from models import (
     DocumentUploadResponse,
@@ -22,6 +24,8 @@ from models import (
     DocumentListResponse,
     SummaryRequest,
     SummaryResponse,
+    CombinedSummaryRequest,
+    CombinedSummaryResponse,
     ChatRequest,
     ChatResponse
 )
@@ -256,37 +260,136 @@ async def generate_summary(doc_id: str, request: SummaryRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.post("/documents/chat", response_model=ChatResponse)
-async def chat_with_document(request: ChatRequest):
-    """Chat with a document using RAG"""
+@app.post("/documents/combined-summary", response_model=CombinedSummaryResponse)
+async def generate_combined_summary(request: CombinedSummaryRequest):
+    """Generate a combined summary across multiple documents"""
     try:
         db = get_database()
         
-        if not ObjectId.is_valid(request.doc_id):
-            raise HTTPException(status_code=400, detail="Invalid document ID")
+        if not request.doc_ids or len(request.doc_ids) == 0:
+            raise HTTPException(status_code=400, detail="At least one document ID required")
         
-        doc = await db.documents.find_one({"_id": ObjectId(request.doc_id)})
-        if not doc:
-            raise HTTPException(status_code=404, detail="Document not found")
+        # Validate all document IDs
+        for doc_id in request.doc_ids:
+            if not ObjectId.is_valid(doc_id):
+                raise HTTPException(status_code=400, detail=f"Invalid document ID: {doc_id}")
         
-        if not vector_store.index_exists(request.doc_id):
-            raise HTTPException(
-                status_code=400,
-                detail="Document not indexed. Please re-upload."
-            )
+        # Verify all documents exist
+        for doc_id in request.doc_ids:
+            doc = await db.documents.find_one({"_id": ObjectId(doc_id)})
+            if not doc:
+                raise HTTPException(status_code=404, detail=f"Document not found: {doc_id}")
         
-        # Invoke RAG workflow
-        result = rag_app.invoke({
-            "question": request.message,
-            "doc_id": request.doc_id,
-            "context_docs": [],
-            "answer": ""
-        })
+        # Generate combined summary
+        summary = summarize_multiple_documents(request.doc_ids, request.summary_type)
         
-        return ChatResponse(
-            answer=result["answer"],
-            doc_id=request.doc_id
+        logger.info(f"Generated combined {request.summary_type} summary for {len(request.doc_ids)} documents")
+        
+        return CombinedSummaryResponse(
+            doc_ids=request.doc_ids,
+            summary_type=request.summary_type,
+            summary=summary
         )
+        
+    except HTTPException:
+        raise
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        logger.error(f"Error generating combined summary: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/documents/chat", response_model=ChatResponse)
+async def chat_with_document(request: ChatRequest):
+    """Chat with a document or multiple documents using RAG"""
+    try:
+        db = get_database()
+        
+        # Determine which documents to use
+        doc_ids = []
+        if request.doc_ids and len(request.doc_ids) > 0:
+            doc_ids = request.doc_ids
+        elif request.doc_id:
+            doc_ids = [request.doc_id]
+        else:
+            raise HTTPException(status_code=400, detail="Either doc_id or doc_ids must be provided")
+        
+        # Validate all document IDs
+        for doc_id in doc_ids:
+            if not ObjectId.is_valid(doc_id):
+                raise HTTPException(status_code=400, detail=f"Invalid document ID: {doc_id}")
+        
+        # Verify all documents exist and are indexed
+        for doc_id in doc_ids:
+            doc = await db.documents.find_one({"_id": ObjectId(doc_id)})
+            if not doc:
+                raise HTTPException(status_code=404, detail=f"Document not found: {doc_id}")
+            
+            if not vector_store.index_exists(doc_id):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Document {doc_id} not indexed. Please re-upload."
+                )
+        
+        # For multiple documents, combine their vectorstores
+        if len(doc_ids) > 1:
+            # Combine context from all documents
+            all_context = []
+            for doc_id in doc_ids:
+                vectorstore = vector_store.load_vectorstore(doc_id)
+                if vectorstore:
+                    docs = vectorstore.similarity_search(request.message, k=3)
+                    all_context.extend([doc.page_content for doc in docs])
+            
+            # Use combined context for RAG
+            combined_context = "\n\n".join(all_context)
+            
+            # Use the first doc_id for response (or we could return all)
+            primary_doc_id = doc_ids[0]
+            
+            # Create a simple RAG response using combined context
+            llm = ChatGoogleGenerativeAI(
+                model="gemini-2.5-flash",
+                google_api_key=settings.gemini_api_key,
+                temperature=0.3
+            )
+            
+            prompt = ChatPromptTemplate.from_messages([
+                ("system", """You are a helpful legal assistant analyzing multiple documents together.
+Answer questions based on the combined context from all documents.
+When information comes from different documents, mention which document it's from if relevant.
+
+Combined context from documents:
+{context}"""),
+                ("human", "{question}")
+            ])
+            
+            chain = prompt | llm
+            result = chain.invoke({
+                "context": combined_context,
+                "question": request.message
+            })
+            
+            answer = result.content if hasattr(result, 'content') else str(result)
+            
+            return ChatResponse(
+                answer=answer,
+                doc_id=primary_doc_id  # Return first doc_id for compatibility
+            )
+        else:
+            # Single document - use existing RAG workflow
+            result = rag_app.invoke({
+                "question": request.message,
+                "doc_id": doc_ids[0],
+                "context_docs": [],
+                "answer": ""
+            })
+            
+            return ChatResponse(
+                answer=result["answer"],
+                doc_id=doc_ids[0]
+            )
         
     except HTTPException:
         raise

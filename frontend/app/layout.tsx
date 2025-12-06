@@ -24,10 +24,8 @@ export default function RootLayout({ children }: { children: ReactNode }) {
                   Court
                 </div>
                 <div className="flex flex-col leading-tight">
-                  <span className="text-sm font-semibold">
-                    Hearing Transcriber
-                  </span>
-                  <span className="text-xs text-muted-foreground">
+                
+                  <span className="text-m text-white">
                     NyayaSetu
                   </span>
                 </div>

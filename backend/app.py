@@ -35,7 +35,11 @@ from fastapi.responses import StreamingResponse
 import google.generativeai as genai
 from youtube_transcript_api import YouTubeTranscriptApi, TranscriptsDisabled
 import re
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import urlparse, parse_qs, quote_plus
+from bs4 import BeautifulSoup
+from sentence_transformers import SentenceTransformer
+import numpy as np
+from typing import List, Dict
 
 # Suppress PyMongo debug logs
 logging.getLogger("pymongo").setLevel(logging.WARNING)
@@ -93,6 +97,14 @@ if not GEMINI_API_KEY:
 else:
     genai.configure(api_key=GEMINI_API_KEY)
     logger.info("Gemini AI configured successfully")
+
+# Initialize SentenceTransformer model for case ranking
+try:
+    embedding_model = SentenceTransformer("sentence-transformers/all-mpnet-base-v2")
+    logger.info("SentenceTransformer model loaded successfully")
+except Exception as e:
+    logger.error(f"Failed to load SentenceTransformer model: {str(e)}")
+    embedding_model = None
 
 app = FastAPI()
 
@@ -197,6 +209,347 @@ def extract_youtube_video_id(url: str) -> str:
     except Exception as e:
         logger.error(f"Error extracting video ID: {str(e)}")
         raise ValueError(f"Invalid YouTube URL: {str(e)}")
+
+# Helper function to extract constitution sections from transcript
+def extract_constitution_sections(text: str) -> List[str]:
+    """
+    Extract constitution sections and articles mentioned in the transcript
+    Returns a list of unique section/article references
+    """
+    sections = set()
+    
+    # Regex patterns for Indian Constitution and legal sections
+    patterns = [
+        # Article patterns (Constitution of India)
+        r'\bArticle\s+(\d+[A-Za-z]?)\b',
+        r'\bArt\.\s*(\d+[A-Za-z]?)\b',
+        r'\bArt\s+(\d+[A-Za-z]?)\b',
+        
+        # Section patterns (IPC, CrPC, etc.)
+        r'\bSection\s+(\d+[A-Za-z]?)\b',
+        r'\bS\.\s*(\d+[A-Za-z]?)\b',
+        r'\bSec\.\s*(\d+[A-Za-z]?)\b',
+        r'\bS\.\s*(\d+[A-Za-z]?)\s+of',
+        
+        # IPC sections
+        r'\bIPC\s+Section\s+(\d+[A-Za-z]?)\b',
+        r'\bSection\s+(\d+[A-Za-z]?)\s+IPC\b',
+        
+        # CrPC sections
+        r'\bCrPC\s+Section\s+(\d+[A-Za-z]?)\b',
+        r'\bSection\s+(\d+[A-Za-z]?)\s+CrPC\b',
+        
+        # Constitution Articles with context
+        r'\bConstitution\s+Article\s+(\d+[A-Za-z]?)\b',
+        r'\bArticle\s+(\d+[A-Za-z]?)\s+of\s+the\s+Constitution\b',
+    ]
+    
+    # Extract using regex
+    for pattern in patterns:
+        matches = re.finditer(pattern, text, re.IGNORECASE)
+        for match in matches:
+            section = match.group(1) if match.groups() else match.group(0)
+            # Determine if it's Article or Section based on context
+            full_match = match.group(0)
+            if 'article' in full_match.lower() or 'art' in full_match.lower():
+                sections.add(f"Article {section}")
+            elif 'section' in full_match.lower() or 's.' in full_match.lower() or 'sec' in full_match.lower():
+                sections.add(f"Section {section}")
+            else:
+                sections.add(section)
+    
+    # Also use Gemini for more accurate extraction if available
+    if GEMINI_API_KEY:
+        try:
+            model = genai.GenerativeModel('gemini-2.5-flash')
+            prompt = f"""Extract all constitution articles and legal sections mentioned in this court hearing transcript.
+            
+Focus on:
+- Constitution of India Articles (e.g., Article 14, Article 19, Article 21)
+- Indian Penal Code (IPC) Sections (e.g., Section 302, Section 420)
+- Code of Criminal Procedure (CrPC) Sections
+- Other relevant legal sections
+
+Transcript excerpt (first 3000 characters):
+{text[:3000]}
+
+Return ONLY a JSON array of unique section/article references in this exact format:
+["Article 14", "Article 21", "Section 302", "Section 420"]
+
+If no sections found, return empty array: []
+"""
+            
+            response = model.generate_content(prompt)
+            response_text = response.text.strip()
+            
+            # Try to extract JSON array
+            try:
+                if "```" in response_text:
+                    response_text = response_text.split("```")[1]
+                    if response_text.startswith("json"):
+                        response_text = response_text[4:]
+                
+                ai_sections = json.loads(response_text)
+                if isinstance(ai_sections, list):
+                    sections.update(ai_sections)
+            except json.JSONDecodeError:
+                # Fallback: extract from text
+                lines = [line.strip().strip('"').strip("'").strip('[').strip(']') 
+                        for line in response_text.split('\n') if line.strip()]
+                for line in lines:
+                    if 'Article' in line or 'Section' in line:
+                        sections.add(line.strip())
+        except Exception as e:
+            logger.debug(f"Gemini extraction failed, using regex only: {str(e)}")
+    
+    # Sort and return unique sections
+    sorted_sections = sorted(list(sections), key=lambda x: (
+        int(re.search(r'\d+', x).group()) if re.search(r'\d+', x) else 9999,
+        x
+    ))
+    
+    logger.info(f"Extracted {len(sorted_sections)} constitution sections: {sorted_sections}")
+    return sorted_sections
+
+# Helper function to generate legal search queries from transcript
+def generate_queries(text: str) -> List[str]:
+    """
+    Generate legal search queries from transcript text using Gemini
+    """
+    try:
+        if not GEMINI_API_KEY:
+            logger.warning("GEMINI_API_KEY not available, using fallback queries")
+            # Fallback: extract key phrases
+            sentences = text.split('.')[:5]
+            return [s.strip()[:100] for s in sentences if len(s.strip()) > 20][:3]
+        
+        model = genai.GenerativeModel('gemini-2.5-flash')
+        prompt = f"""Analyze this court hearing transcript and generate 3-5 specific legal search queries 
+that would help find relevant case law and precedents. Focus on:
+- Legal issues discussed
+- Key legal concepts
+- Specific legal questions raised
+- Important legal terms or doctrines
+
+Transcript excerpt (first 2000 characters):
+{text[:2000]}
+
+Return ONLY a JSON array of query strings, one per line, no additional text.
+Example format:
+["query 1", "query 2", "query 3"]
+"""
+        
+        response = model.generate_content(prompt)
+        response_text = response.text.strip()
+        
+        # Try to extract JSON array
+        try:
+            # Remove markdown code blocks if present
+            if "```" in response_text:
+                response_text = response_text.split("```")[1]
+                if response_text.startswith("json"):
+                    response_text = response_text[4:]
+            
+            queries = json.loads(response_text)
+            if isinstance(queries, list) and len(queries) > 0:
+                return queries[:5]  # Limit to 5 queries
+        except json.JSONDecodeError:
+            # Fallback: split by lines and clean
+            queries = [q.strip().strip('"').strip("'") for q in response_text.split('\n') if q.strip()]
+            queries = [q for q in queries if len(q) > 10][:5]
+            if queries:
+                return queries
+        
+        # Final fallback
+        return ["court hearing legal issues", "judicial precedents", "case law"]
+        
+    except Exception as e:
+        logger.error(f"Error generating queries: {str(e)}")
+        return ["court hearing legal issues", "judicial precedents", "case law"]
+
+# Helper function to search Indian Kanoon
+def search_indiankanoon(query: str) -> List[Dict]:
+    """
+    Search Indian Kanoon and return case results
+    Returns list of dicts with: title, snippet, url
+    """
+    try:
+        # Indian Kanoon search URL
+        search_url = f"https://indiankanoon.org/search/?formInput={quote_plus(query)}"
+        
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        }
+        
+        response = requests.get(search_url, headers=headers, timeout=15)
+        response.raise_for_status()
+        
+        soup = BeautifulSoup(response.content, 'lxml')
+        results = []
+        
+        # Indian Kanoon search results structure:
+        # Results are typically in <div class="result"> or <li> elements
+        # Each result has an <a> tag with href pointing to /doc/{doc_id}/
+        
+        # Method 1: Look for result divs
+        result_divs = soup.find_all('div', class_='result')
+        if not result_divs:
+            result_divs = soup.find_all('div', class_='search_result')
+        if not result_divs:
+            result_divs = soup.find_all('div', {'class': re.compile(r'result|search', re.I)})
+        
+        for div in result_divs[:15]:  # Limit to 15 results per query
+            try:
+                # Extract URL from <a> tag (most reliable)
+                link_elem = div.find('a', href=True)
+                if not link_elem:
+                    continue
+                
+                url = link_elem.get('href', '')
+                if not url:
+                    continue
+                
+                # Ensure URL is absolute
+                if url.startswith('/'):
+                    url = f"https://indiankanoon.org{url}"
+                elif not url.startswith('http'):
+                    url = f"https://indiankanoon.org/{url}"
+                
+                # Extract title from link text or nearby heading
+                title = link_elem.get_text(strip=True)
+                if not title or len(title) < 5:
+                    # Try to find title in heading
+                    heading = div.find('h2') or div.find('h3') or div.find('h4')
+                    if heading:
+                        title = heading.get_text(strip=True)
+                
+                if not title or len(title) < 5:
+                    continue
+                
+                # Extract snippet
+                snippet = ""
+                snippet_elem = div.find('div', class_='snippet') or div.find('p', class_='snippet')
+                if snippet_elem:
+                    snippet = snippet_elem.get_text(strip=True)
+                else:
+                    # Try to get any paragraph text
+                    p_elems = div.find_all('p')
+                    for p in p_elems:
+                        text = p.get_text(strip=True)
+                        if text and len(text) > 20:
+                            snippet = text
+                            break
+                
+                # Clean up snippet
+                snippet = snippet[:500] if snippet else ""
+                
+                results.append({
+                    "title": title,
+                    "snippet": snippet,
+                    "url": url
+                })
+            except Exception as e:
+                logger.debug(f"Error parsing result div: {str(e)}")
+                continue
+        
+        # Method 2: If no results, look for direct document links
+        if not results:
+            # Look for links to /doc/ (case documents)
+            doc_links = soup.find_all('a', href=re.compile(r'/doc/\d+'))
+            for link in doc_links[:15]:
+                try:
+                    url = link.get('href', '')
+                    if not url:
+                        continue
+                    
+                    # Make URL absolute
+                    if url.startswith('/'):
+                        url = f"https://indiankanoon.org{url}"
+                    elif not url.startswith('http'):
+                        url = f"https://indiankanoon.org/{url}"
+                    
+                    title = link.get_text(strip=True)
+                    if not title or len(title) < 5:
+                        # Try parent element
+                        parent = link.find_parent(['div', 'li', 'td'])
+                        if parent:
+                            title = parent.get_text(strip=True)[:200]
+                    
+                    if not title or len(title) < 5:
+                        continue
+                    
+                    # Try to get snippet from nearby elements
+                    snippet = ""
+                    parent = link.find_parent(['div', 'li'])
+                    if parent:
+                        p_elem = parent.find('p')
+                        if p_elem:
+                            snippet = p_elem.get_text(strip=True)[:500]
+                    
+                    results.append({
+                        "title": title[:200],  # Limit title length
+                        "snippet": snippet,
+                        "url": url
+                    })
+                except Exception as e:
+                    logger.debug(f"Error parsing doc link: {str(e)}")
+                    continue
+        
+        # Remove duplicates based on URL
+        seen_urls = set()
+        unique_results = []
+        for result in results:
+            url = result.get('url', '')
+            if url and url not in seen_urls:
+                seen_urls.add(url)
+                unique_results.append(result)
+        
+        logger.info(f"Found {len(unique_results)} unique results for query: {query}")
+        return unique_results[:10]  # Return top 10 unique results
+        
+    except requests.exceptions.RequestException as e:
+        logger.error(f"Network error searching Indian Kanoon: {str(e)}")
+        return []
+    except Exception as e:
+        logger.error(f"Error searching Indian Kanoon: {str(e)}")
+        return []
+
+# Helper function to rank cases by similarity
+def rank_cases(text: str, cases: List[Dict]) -> List[Dict]:
+    """
+    Rank cases by semantic similarity to transcript text
+    Returns top 5 cases with similarity scores
+    """
+    try:
+        if not embedding_model or not cases:
+            # Return first 5 cases if no model or no cases
+            return cases[:5]
+        
+        # Create embeddings for transcript and cases
+        transcript_embedding = embedding_model.encode(text, convert_to_numpy=True)
+        
+        # Create embeddings for all cases (title + snippet)
+        case_texts = [f"{case.get('title', '')} {case.get('snippet', '')}" for case in cases]
+        case_embeddings = embedding_model.encode(case_texts, convert_to_numpy=True)
+        
+        # Calculate cosine similarity
+        similarities = np.dot(case_embeddings, transcript_embedding) / (
+            np.linalg.norm(case_embeddings, axis=1) * np.linalg.norm(transcript_embedding)
+        )
+        
+        # Add similarity scores to cases
+        for i, case in enumerate(cases):
+            case['similarity_score'] = float(similarities[i])
+        
+        # Sort by similarity (descending) and return top 5
+        ranked_cases = sorted(cases, key=lambda x: x.get('similarity_score', 0), reverse=True)
+        
+        return ranked_cases[:5]
+        
+    except Exception as e:
+        logger.error(f"Error ranking cases: {str(e)}")
+        # Return first 5 cases as fallback
+        return cases[:5]
 
 # YouTube transcript endpoint
 @app.post("/transcribe-youtube/")
@@ -530,6 +883,7 @@ async def transcribe_media(file: UploadFile = File(...)):
 async def summarize_transcript(request: SummaryRequest):
     """
     Generate a summary of the transcript using Gemini AI
+    Also generates legal queries, searches Indian Kanoon, and ranks related cases
     """
     logger.info(f"Generating summary for transcript: {request.transcript_id}")
     
@@ -539,9 +893,24 @@ async def summarize_transcript(request: SummaryRequest):
         if not transcript:
             raise HTTPException(status_code=404, detail="Transcript not found")
         
+        # Get text from transcript - try multiple sources
         full_text = transcript.get("text", "")
-        if not full_text:
-            raise HTTPException(status_code=400, detail="Transcript has no text content")
+        
+        # If text field is empty, try to reconstruct from transcription segments
+        if not full_text or not full_text.strip():
+            transcription_segments = transcript.get("transcription", [])
+            if transcription_segments:
+                full_text = " ".join([
+                    segment.get("text", "") 
+                    for segment in transcription_segments 
+                    if segment.get("text", "").strip()
+                ])
+        
+        if not full_text or not full_text.strip():
+            raise HTTPException(
+                status_code=400, 
+                detail="Transcript has no text content. Please ensure the transcript was processed correctly."
+            )
         
         # Prepare prompt based on summary type
         prompts = {
@@ -575,23 +944,53 @@ Key Points:"""
         
         summary_text = response.text
         
-        # Save summary to MongoDB
+        # Generate legal search queries
+        logger.info("Generating legal search queries...")
+        queries = generate_queries(full_text)
+        logger.info(f"Generated {len(queries)} queries: {queries}")
+        
+        # Search Indian Kanoon for each query
+        all_cases = []
+        for query in queries:
+            logger.info(f"Searching Indian Kanoon for: {query}")
+            cases = search_indiankanoon(query)
+            all_cases.extend(cases)
+        
+        # Remove duplicates based on URL
+        seen_urls = set()
+        unique_cases = []
+        for case in all_cases:
+            url = case.get("url", "")
+            if url and url not in seen_urls:
+                seen_urls.add(url)
+                unique_cases.append(case)
+        
+        # Rank cases by similarity
+        logger.info(f"Ranking {len(unique_cases)} unique cases...")
+        ranked_cases = rank_cases(full_text, unique_cases)
+        
+        # Save summary and related cases to MongoDB
         collection.update_one(
             {"_id": ObjectId(request.transcript_id)},
             {
                 "$set": {
                     f"summary_{request.summary_type}": summary_text,
-                    f"summary_{request.summary_type}_generated_at": datetime.datetime.now()
+                    f"summary_{request.summary_type}_generated_at": datetime.datetime.now(),
+                    "related_cases": ranked_cases,
+                    "legal_queries_used": queries
                 }
             }
         )
         
         logger.info(f"Summary generated successfully for transcript: {request.transcript_id}")
+        logger.info(f"Found {len(ranked_cases)} related cases")
         
         return JSONResponse({
             "transcript_id": request.transcript_id,
             "summary_type": request.summary_type,
             "summary": summary_text,
+            "related_cases": ranked_cases,
+            "legal_queries_used": queries,
             "generated_at": datetime.datetime.now().isoformat()
         })
         
@@ -604,6 +1003,7 @@ Key Points:"""
 async def chat_with_transcript(request: ChatRequest):
     """
     Ask questions about a specific transcript using Gemini AI chatbot
+    Includes related case law in context if available
     """
     logger.info(f"Chat request for transcript: {request.transcript_id}")
     
@@ -613,18 +1013,63 @@ async def chat_with_transcript(request: ChatRequest):
         if not transcript:
             raise HTTPException(status_code=404, detail="Transcript not found")
         
+        # Get text from transcript - try multiple sources
         full_text = transcript.get("text", "")
-        if not full_text:
-            raise HTTPException(status_code=400, detail="Transcript has no text content")
+        
+        # If text field is empty, try to reconstruct from transcription segments
+        if not full_text or not full_text.strip():
+            transcription_segments = transcript.get("transcription", [])
+            if transcription_segments:
+                full_text = " ".join([
+                    segment.get("text", "") 
+                    for segment in transcription_segments 
+                    if segment.get("text", "").strip()
+                ])
+        
+        if not full_text or not full_text.strip():
+            raise HTTPException(
+                status_code=400, 
+                detail="Transcript has no text content. Please ensure the transcript was processed correctly."
+            )
+        
+        # Get related cases and queries if available
+        related_cases = transcript.get("related_cases", [])
+        queries_used = transcript.get("legal_queries_used", [])
         
         # Build conversation context
         conversation_context = f"""You are an AI assistant helping analyze a court hearing transcript. 
-Here is the transcript:
 
+================ TRANSCRIPT ================
 {full_text}
 
-You should answer questions about this transcript accurately and provide relevant quotes when applicable.
-Always base your answers on the transcript content provided above."""
+"""
+        
+        # Add related case law if available
+        if related_cases:
+            cases_text = json.dumps(related_cases, indent=2)
+            conversation_context += f"""
+================ RELATED CASE LAW ================
+{cases_text}
+
+"""
+        
+        # Add search queries if available
+        if queries_used:
+            queries_text = "\n".join([f"- {q}" for q in queries_used])
+            conversation_context += f"""
+================ SEARCH QUERIES USED ================
+{queries_text}
+
+"""
+        
+        conversation_context += """
+Instructions:
+- When asked about past judgments or precedents, ALWAYS refer to related_cases if available.
+- Never answer "no case law available" if related_cases list is not empty.
+- Base your answers on the transcript content provided above.
+- When referencing case law, mention the case title and provide the URL if available.
+- Provide relevant quotes from the transcript when applicable.
+"""
         
         # Build chat history for context
         chat_history = []
@@ -703,6 +1148,38 @@ async def get_transcript(transcript_id: str):
             raise HTTPException(status_code=404, detail="Transcript not found")
         
         logger.debug(f"Transcript found: {transcript_id}")
+        
+        # Ensure text field exists - reconstruct from segments if missing
+        full_text = transcript.get("text", "")
+        if not full_text or not full_text.strip():
+            transcription_segments = transcript.get("transcription", [])
+            if transcription_segments:
+                full_text = " ".join([
+                    segment.get("text", "") 
+                    for segment in transcription_segments 
+                    if segment.get("text", "").strip()
+                ])
+                # Update MongoDB with reconstructed text
+                if full_text:
+                    collection.update_one(
+                        {"_id": ObjectId(transcript_id)},
+                        {"$set": {"text": full_text}}
+                    )
+                    transcript["text"] = full_text
+        
+        # Extract constitution sections if not already stored
+        if full_text and "constitution_sections" not in transcript:
+            logger.info("Extracting constitution sections from transcript")
+            sections = extract_constitution_sections(full_text)
+            # Update MongoDB with extracted sections
+            collection.update_one(
+                {"_id": ObjectId(transcript_id)},
+                {"$set": {"constitution_sections": sections}}
+            )
+            transcript["constitution_sections"] = sections
+        elif "constitution_sections" in transcript:
+            # Use existing sections
+            transcript["constitution_sections"] = transcript.get("constitution_sections", [])
         
         transcript["_id"] = str(transcript["_id"])
         if "created_at" in transcript:

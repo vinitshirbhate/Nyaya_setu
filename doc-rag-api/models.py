@@ -27,7 +27,8 @@ class SummaryRequest(BaseModel):
 
 
 class ChatRequest(BaseModel):
-    doc_id: str
+    doc_id: Optional[str] = None
+    doc_ids: Optional[list[str]] = None
     message: str
 
 
@@ -55,6 +56,17 @@ class DocumentListResponse(BaseModel):
 
 class SummaryResponse(BaseModel):
     doc_id: str
+    summary_type: str
+    summary: str
+
+
+class CombinedSummaryRequest(BaseModel):
+    doc_ids: list[str]
+    summary_type: Literal["brief", "detailed", "key_points"]
+
+
+class CombinedSummaryResponse(BaseModel):
+    doc_ids: list[str]
     summary_type: str
     summary: str
 

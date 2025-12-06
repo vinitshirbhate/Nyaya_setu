@@ -146,3 +146,88 @@ def summarize_document(doc_id: str, summary_type: SummaryType) -> str:
     except Exception as e:
         logger.error(f"Error generating summary for doc_id {doc_id}: {e}")
         raise Exception(f"Failed to generate summary: {str(e)}")
+
+
+def summarize_multiple_documents(doc_ids: list[str], summary_type: SummaryType) -> str:
+    """
+    Generate a combined summary across multiple documents
+    
+    Args:
+        doc_ids: List of document identifiers
+        summary_type: Type of summary to generate (brief, detailed, key_points)
+    
+    Returns:
+        Generated combined summary text
+    
+    Raises:
+        ValueError: If documents not found or no content available
+        Exception: For other errors during summarization
+    """
+    try:
+        logger.info(f"Generating {summary_type} combined summary for {len(doc_ids)} documents")
+        
+        all_chunks = []
+        
+        # Collect chunks from all documents
+        for doc_id in doc_ids:
+            vectorstore = vector_store.load_vectorstore(doc_id)
+            if not vectorstore:
+                logger.warning(f"No vectorstore found for document: {doc_id}")
+                continue
+            
+            # Get chunks from this document
+            docs = vectorstore.similarity_search("document content", k=30)
+            for doc in docs:
+                all_chunks.append({
+                    "content": doc.page_content,
+                    "doc_id": doc_id
+                })
+        
+        if not all_chunks:
+            raise ValueError(f"No content found across {len(doc_ids)} documents")
+        
+        # Combine all document content
+        combined_text = "\n\n".join([
+            f"[Document: {chunk['doc_id']}]\n{chunk['content']}"
+            for chunk in all_chunks
+        ])
+        
+        # Get prompt based on summary type
+        _, combine_prompt_text = get_summary_prompt(summary_type)
+        
+        # Modify prompt for multiple documents
+        if len(doc_ids) > 1:
+            combine_prompt_text = f"""You are analyzing multiple legal documents together. Provide a comprehensive summary that:
+- Synthesizes information across all {len(doc_ids)} documents
+- Identifies common themes and patterns
+- Highlights differences or contradictions if any
+- Provides a unified understanding of the combined content
+
+{combine_prompt_text}"""
+        
+        # Initialize LLM
+        llm = ChatGoogleGenerativeAI(
+            model="gemini-2.5-flash",
+            google_api_key=settings.gemini_api_key,
+            temperature=0.3
+        )
+        
+        # Create prompt template
+        prompt = PromptTemplate(template=combine_prompt_text, input_variables=["text"])
+        
+        # Generate summary directly
+        chain = prompt | llm
+        result = chain.invoke({"text": combined_text})
+        
+        # Extract content from result
+        summary = result.content if hasattr(result, 'content') else str(result)
+        
+        logger.info(f"Successfully generated {summary_type} combined summary for {len(doc_ids)} documents")
+        return summary
+        
+    except ValueError as e:
+        logger.error(f"Validation error in summarize_multiple_documents: {e}")
+        raise
+    except Exception as e:
+        logger.error(f"Error generating combined summary: {e}")
+        raise Exception(f"Failed to generate combined summary: {str(e)}")
